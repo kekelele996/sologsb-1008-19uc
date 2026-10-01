@@ -1,4 +1,4 @@
-import type { ReviewStatus, SignItem, SignProject, TermBinding } from "./types";
+import type { ReviewStatus, SignItem, SignProject, TermBinding, TermEntry, TermMaster } from "./types";
 
 export const uid = (prefix: string) =>
   `${prefix}-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`;
@@ -10,15 +10,37 @@ export const STATUS_LABELS: Record<ReviewStatus, string> = {
   changes: "需修改",
 };
 
-const term = (source: string, target: string, confirmed = false, required = true): TermBinding => ({
-  id: uid("term"),
-  source,
-  target,
+/** 按语种定译法的术语总表（管理员维护） */
+export const createSeedMaster = (): TermMaster => {
+  const now = "2026-09-20T08:00:00.000Z";
+  const entries: TermEntry[] = [
+    { id: "term-waiting-area", source: "候车区", language: "English", target: "Waiting Area", status: "active", note: "轨道交通站台标准译法", updatedAt: now },
+    { id: "term-yellow-line", source: "黄线", language: "English", target: "yellow line", status: "active", note: "", updatedAt: now },
+    { id: "term-emergency-exit", source: "紧急出口", language: "English", target: "EMERGENCY EXIT", status: "active", note: "消防安全标志固定译法", updatedAt: now },
+    { id: "term-elevator", source: "电梯", language: "English", target: "elevator", status: "active", note: "", updatedAt: now },
+    { id: "term-drinking-water", source: "直饮水", language: "日本語", target: "飲料水", status: "active", note: "", updatedAt: now },
+    { id: "term-drain", source: "水槽", language: "日本語", target: "排水口", status: "active", note: "", updatedAt: now },
+    { id: "term-no-smoking", source: "禁止吸烟", language: "Français", target: "INTERDICTION DE FUMER", status: "active", note: "", updatedAt: now },
+    { id: "term-e-cigarette", source: "电子烟", language: "Français", target: "Cigarettes électroniques", status: "active", note: "", updatedAt: now },
+  ];
+  return { schema: 1, entries, updatedAt: now };
+};
+
+/** 引用总表条目的术语绑定 */
+export const bindTerm = (entry: TermEntry, confirmed = false, required = true): TermBinding => ({
+  id: uid("bind"),
+  entryId: entry.id,
+  source: entry.source,
+  target: entry.target,
+  entryUpdatedAt: entry.updatedAt,
   required,
   confirmed,
+  note: "",
+  stale: false,
 });
 
-export const createSeedProject = (): SignProject => {
+export const createSeedProject = (master: TermMaster = createSeedMaster()): SignProject => {
+  const byId = (id: string) => master.entries.find((entry) => entry.id === id)!;
   const signs: SignItem[] = [
     {
       id: "sign-platform",
@@ -29,7 +51,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "轨道交通站台",
       regulation: "GB/T 10001.1-2023 公共信息图形符号",
       status: "pending",
-      terms: [term("候车区", "Waiting Area"), term("黄线", "yellow line")],
+      terms: [bindTerm(byId("term-waiting-area")), bindTerm(byId("term-yellow-line"))],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -44,7 +66,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "商场疏散通道",
       regulation: "GB 13495.1-2015 消防安全标志",
       status: "confirmed",
-      terms: [term("紧急出口", "EMERGENCY EXIT", true), term("电梯", "elevator", true)],
+      terms: [bindTerm(byId("term-emergency-exit"), true), bindTerm(byId("term-elevator"), true)],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -59,7 +81,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "公园服务亭",
       regulation: "城市公共设施双语标识译写规范",
       status: "changes",
-      terms: [term("直饮水", "飲料水"), term("水槽", "排水口")],
+      terms: [bindTerm(byId("term-drinking-water")), bindTerm(byId("term-drain"))],
       comments: [],
       versions: [],
       emergencyRevision: false,
@@ -74,7 +96,7 @@ export const createSeedProject = (): SignProject => {
       scenario: "医院入口",
       regulation: "公共场所卫生管理条例实施细则",
       status: "draft",
-      terms: [term("禁止吸烟", "INTERDICTION DE FUMER"), term("电子烟", "Cigarettes électroniques")],
+      terms: [bindTerm(byId("term-no-smoking")), bindTerm(byId("term-e-cigarette"))],
       comments: [],
       versions: [],
       emergencyRevision: false,

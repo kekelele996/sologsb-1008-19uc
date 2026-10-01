@@ -1,8 +1,9 @@
 import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io/qwik";
 import { type DocumentHead } from "@builder.io/qwik-city";
-import { createSeedProject, STATUS_LABELS, uid } from "../data";
-import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { bindTerm, createSeedMaster, createSeedProject, STATUS_LABELS, uid } from "../data";
+import type { ReviewStatus, SignItem, SignProject, TermBinding, TermMaster } from "../types";
+import { analyzeSign, cloneTerms, diffText, loadMaster, migrateProject, reconcileBinding, retrySync, saveMaster, syncProject } from "../utils";
+import { TermMasterModal } from "../components/term-master-modal";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
@@ -30,14 +31,20 @@ export default component$(() => {
   const previewWidth = useSignal(480);
   const previewFont = useSignal(42);
   const selectedVersionId = useSignal("");
-  const termSource = useSignal("");
-  const termTarget = useSignal("");
   const commentDraft = useSignal("");
   const replyDraft = useSignal("");
   const replyingTo = useSignal("");
   const toast = useSignal("");
   const previewId = useSignal("");
   const readOnly = useSignal(false);
+  const master = useSignal<TermMaster>(createSeedMaster());
+  const masterOk = useSignal(true);
+  const masterError = useSignal("");
+  const masterModalOpen = useSignal(false);
+  const syncReport = useSignal<{ changed: number; deactivated: number; missing: number; reactivated: number } | null>(null);
+  const migratedCount = useSignal(0);
+  const retryScheduled = useSignal(false);
+  const termEntryId = useSignal("");
   const active = () => project.value.signs.find((sign) => sign.id === (previewId.value || project.value.activeSignId)) ?? project.value.signs[0];
 
   const commit = $((label: string, update: (draft: SignProject) => void) => {
@@ -126,16 +133,68 @@ export default component$(() => {
     toast.value = "版本快照已保存";
   });
 
-  const addTerm = $(() => {
-    const source = termSource.value.trim();
-    const target = termTarget.value.trim();
-    if (!source || !target) return;
-    updateActive("绑定术语", (sign) => {
-      sign.terms.push({ id: uid("term"), source, target, required: true, confirmed: false });
+  const referenceTerm = $(() => {
+    const entryId = termEntryId.value;
+    if (!entryId) return;
+    const entry = master.value.entries.find((item) => item.id === entryId);
+    if (!entry) return;
+    updateActive("引用术语", (sign) => {
+      if (sign.terms.some((term) => term.entryId === entryId)) return;
+      sign.terms.push(bindTerm(entry));
       sign.status = "pending";
     });
-    termSource.value = "";
-    termTarget.value = "";
+    termEntryId.value = "";
+  });
+
+  const reconcileTerm = $((bindingId: string) => {
+    const target = project.value.signs.find((sign) => sign.id === project.value.activeSignId)?.terms.find((term) => term.id === bindingId);
+    if (!target) return;
+    const entry = master.value.entries.find((item) => item.id === target.entryId);
+    if (!entry) return;
+    commit("重新确认术语", (draft) => {
+      const sign = draft.signs.find((item) => item.id === draft.activeSignId);
+      const binding = sign?.terms.find((item) => item.id === bindingId);
+      if (binding) Object.assign(binding, reconcileBinding(binding, entry));
+    });
+  });
+
+  const handleSaveMaster = $((newMaster: TermMaster) => {
+    master.value = newMaster;
+    saveMaster(newMaster);
+    const { project: syncedProject, report } = syncProject(project.value, newMaster);
+    project.value = syncedProject;
+    syncReport.value = report;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: syncedProject }));
+    const staleCount = report.changed + report.deactivated + report.missing;
+    if (staleCount > 0) toast.value = `${staleCount} 条术语待重新确认`;
+  });
+
+  const scheduleRetry = $(() => {
+    if (retryScheduled.value) return;
+    retryScheduled.value = true;
+    window.setTimeout(() => {
+      retryScheduled.value = false;
+      retryMasterSync();
+    }, 3000);
+  });
+
+  const retryMasterSync = $(() => {
+    const loaded = loadMaster();
+    if (!loaded.ok || !loaded.master) {
+      masterOk.value = false;
+      masterError.value = loaded.error ?? "术语总表读取失败";
+      scheduleRetry();
+      return;
+    }
+    const { project: syncedProject, report } = retrySync(project.value, loaded.master, project.value.activeSignId);
+    master.value = loaded.master;
+    masterOk.value = true;
+    masterError.value = "";
+    project.value = syncedProject;
+    syncReport.value = report;
+    saveMaster(loaded.master);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: syncedProject }));
+    toast.value = "术语总表已重新同步";
   });
 
   const addComment = $(() => {
@@ -184,15 +243,57 @@ export default component$(() => {
   useVisibleTask$(({ track }) => {
     track(() => hydrated.value);
     if (!hydrated.value) {
+      // 读取术语总表（失败则回退到快照继续校对）
+      const loaded = loadMaster();
+      const effectiveMaster = loaded.master ?? createSeedMaster();
+
+      // 读取项目数据
+      let storedProject: SignProject;
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
-        const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
-        previewId.value = requestedPreview;
-        readOnly.value = Boolean(requestedPreview);
+        if (stored.schema === 1 && stored.project?.signs?.length) {
+          storedProject = stored.project;
+        } else {
+          storedProject = createSeedProject(effectiveMaster);
+        }
       } catch {
-        // Keep bundled sample data when storage is unavailable or malformed.
+        storedProject = createSeedProject(effectiveMaster);
       }
+
+      // 旧数据第一次打开迁移进引用，重复的合成一条
+      const { project: migratedProject, master: migratedMaster, migratedCount: migrated } = migrateProject(storedProject, effectiveMaster);
+
+      // 与总表同步
+      const { project: syncedProject, report } = syncProject(migratedProject, loaded.master);
+
+      // 持久化
+      saveMaster(migratedMaster);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ schema: 1, project: syncedProject }));
+
+      master.value = migratedMaster;
+      masterOk.value = loaded.ok;
+      masterError.value = loaded.error ?? "";
+      project.value = syncedProject;
+      syncReport.value = report;
+      migratedCount.value = migrated;
+
+      // 失败后按侧重试
+      if (!loaded.ok) scheduleRetry();
+
+      // 迁移或同步提示
+      const staleCount = report.changed + report.deactivated + report.missing;
+      if (migrated > 0 || staleCount > 0) {
+        const parts: string[] = [];
+        if (migrated > 0) parts.push(`已迁移 ${migrated} 条术语至总表引用`);
+        if (staleCount > 0) parts.push(`${staleCount} 条术语待重新确认`);
+        toast.value = parts.join("，");
+      }
+
+      // 只读预览链接
+      const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
+      previewId.value = requestedPreview;
+      readOnly.value = Boolean(requestedPreview);
+
       hydrated.value = true;
     }
   });
@@ -294,6 +395,7 @@ export default component$(() => {
           <span class={`badge ${online.value ? "badge-success" : "badge-warning"} badge-outline`}>{online.value ? "在线" : "离线草稿"}</span>
           <button class="btn btn-ghost btn-sm" disabled={!past.value.length} onClick$={undo}>撤销</button>
           <button class="btn btn-ghost btn-sm" disabled={!future.value.length} onClick$={redo}>重做</button>
+          <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={() => masterModalOpen.value = true}>术语总表</button>
           <button class="btn btn-sm border-white/20 bg-white/10 text-white hover:bg-white/20" onClick$={sharePreview}>复制只读链接</button>
           <button class={`btn btn-sm ${active().emergencyRevision ? "btn-error" : "btn-warning"}`} onClick$={toggleEmergency}>
             {active().emergencyRevision ? "退出紧急修订" : "紧急修订"}
@@ -305,6 +407,14 @@ export default component$(() => {
         <div class="alert alert-error sticky top-16 z-30 rounded-none border-x-0 py-2 text-white">
           <span class="text-lg">!</span>
           <span><strong>紧急修订模式</strong>：确认操作已锁定，修改后必须重新审校并保存版本。</span>
+        </div>
+      )}
+
+      {!masterOk.value && (
+        <div class="alert alert-warning sticky top-16 z-30 rounded-none border-x-0 py-2">
+          <span class="text-lg">!</span>
+          <span><strong>术语总表读取失败</strong>：已按上一版快照继续校对。{masterError.value && `（${masterError.value}）`}</span>
+          <button class="btn btn-xs btn-outline" onClick$={retryMasterSync}>重试</button>
         </div>
       )}
 
@@ -409,14 +519,14 @@ export default component$(() => {
                     return (
                       <button
                         key={term.id}
-                        title="点击切换术语确认状态"
-                        class={`badge badge-lg gap-1 ${matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
+                        title={term.stale ? "总表已变更，待重新确认" : "点击切换术语确认状态"}
+                        class={`badge badge-lg gap-1 ${term.stale ? "badge-warning" : matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
                         onClick$={() => updateActive("确认术语", (sign) => {
                           const current = sign.terms.find((item) => item.id === term.id);
                           if (current) current.confirmed = !current.confirmed;
                         })}
                       >
-                        {term.source} → {term.target} {matched ? (term.confirmed ? "✓" : "!") : "×"}
+                        {term.source} → {term.target} {term.stale ? "⟳" : matched ? (term.confirmed ? "✓" : "!") : "×"}
                       </button>
                     );
                   })}
@@ -427,27 +537,55 @@ export default component$(() => {
             <section class="card border border-slate-200 bg-white shadow-sm">
               <div class="card-body p-5">
                 <div class="flex items-center justify-between">
-                  <div><h2 class="font-bold">术语绑定</h2><p class="text-xs text-slate-500">必选术语未出现在译文中时会实时告警。</p></div>
-                  <span class="badge badge-outline">{active().terms.length} 条</span>
+                  <div><h2 class="font-bold">术语绑定</h2><p class="text-xs text-slate-500">引用术语总表条目，必选术语未出现在译文中时会实时告警。</p></div>
+                  <button class="btn btn-xs btn-ghost" onClick$={() => masterModalOpen.value = true}>管理总表</button>
                 </div>
-                <div class="mt-4 grid grid-cols-[1fr_1fr_auto] gap-2">
-                  <input class="input input-sm input-bordered" placeholder="中文术语" value={termSource.value} onInput$={(_, element) => termSource.value = element.value} />
-                  <input class="input input-sm input-bordered" placeholder="目标语言固定译法" value={termTarget.value} onInput$={(_, element) => termTarget.value = element.value} />
-                  <button class="btn btn-sm btn-primary" onClick$={addTerm}>绑定</button>
+                <div class="mt-4 flex gap-2">
+                  <select class="select select-sm select-bordered flex-1" value={termEntryId.value} onChange$={(_, el) => termEntryId.value = el.value}>
+                    <option value="">选择总表条目引用…</option>
+                    {master.value.entries
+                      .filter((entry) => entry.language === active().targetLanguage && entry.status === "active")
+                      .map((entry) => (
+                        <option key={entry.id} value={entry.id}>{`${entry.source} → ${entry.target}`}</option>
+                      ))}
+                  </select>
+                  <button class="btn btn-sm btn-primary" onClick$={referenceTerm}>引用</button>
                 </div>
                 <div class="mt-3 grid gap-2 md:grid-cols-2">
-                  {active().terms.map((term) => (
-                    <div key={term.id} class="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2">
-                      <div class="min-w-0">
-                        <div class="truncate text-xs font-bold">{term.source}</div>
-                        <div class="truncate text-xs text-slate-500">{term.target}</div>
+                  {active().terms.map((term) => {
+                    const entry = master.value.entries.find((item) => item.id === term.entryId);
+                    return (
+                      <div key={term.id} class={`rounded-lg border p-3 ${term.stale ? "border-warning bg-warning/5" : "border-slate-200"}`}>
+                        <div class="flex items-center justify-between gap-2">
+                          <div class="min-w-0">
+                            <div class="truncate text-xs font-bold">{term.source} → {term.target}</div>
+                            {term.stale && (
+                              <div class="mt-1 text-[11px] text-warning">
+                                {term.staleReason === "changed" && "总表已更新译法，待重新确认"}
+                                {term.staleReason === "deactivated" && "总表已停用该条目，待重新确认"}
+                                {term.staleReason === "missing" && "总表中找不到该条目，待重新确认"}
+                              </div>
+                            )}
+                          </div>
+                          <div class="flex shrink-0 gap-1">
+                            {term.stale && entry && (
+                              <button class="btn btn-xs btn-warning" onClick$={() => reconcileTerm(term.id)}>重新确认</button>
+                            )}
+                            <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.confirmed = !target.confirmed; })}>确认</button>
+                            <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); })}>删除</button>
+                          </div>
+                        </div>
+                        {term.stale && entry && entry.target !== term.target && (
+                          <div class="mt-2 rounded bg-slate-100 px-2 py-1 text-[11px] text-slate-600">
+                            总表当前译法：{entry.target}
+                          </div>
+                        )}
                       </div>
-                      <div class="flex gap-1">
-                        <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.confirmed = !target.confirmed; })}>确认</button>
-                        <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); })}>删除</button>
-                      </div>
-                    </div>
-                  ))}
+                    );
+                  })}
+                  {active().terms.length === 0 && (
+                    <div class="rounded-xl border border-dashed p-4 text-center text-xs text-slate-400">还没有绑定术语，从上方下拉框选择总表条目引用。</div>
+                  )}
                 </div>
               </div>
             </section>
@@ -553,6 +691,14 @@ export default component$(() => {
       </div>
 
       {toast.value && <div class="toast toast-end z-50"><div class="alert alert-success"><span>{toast.value}</span></div></div>}
+
+      {masterModalOpen.value && (
+        <TermMasterModal
+          master={master.value}
+          onClose={() => masterModalOpen.value = false}
+          onSave={handleSaveMaster}
+        />
+      )}
     </div>
   );
 });
