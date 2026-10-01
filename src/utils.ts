@@ -1,4 +1,5 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, SignItem } from "./types";
+import type { ResolvedTerm } from "./glossary";
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -12,7 +13,7 @@ export function estimatedLines(text: string, width: number, fontSize: number, li
     let current = "";
     let currentWidth = 0;
     for (const char of hardLine) {
-      const charWidth = /[\u2e80-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(char)
+      const charWidth = /[⺀-鿿぀-ヿ가-힯]/.test(char)
         ? fontSize
         : char === " "
           ? fontSize * 0.34
@@ -31,16 +32,36 @@ export function estimatedLines(text: string, width: number, fontSize: number, li
   return lines;
 }
 
-export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
+export interface SignAnalysis {
+  lines: string[];
+  visible: string[];
+  overflow: boolean;
+  tooLong: boolean;
+  missingTerms: ResolvedTerm[];
+  risk: "high" | "medium" | "low";
+}
+
+/**
+ * 必选术语命中检查以总表权威译法（canonicalTarget）为准；
+ * 已停用或缺语种的引用无法核对，算作未命中。
+ */
+export function analyzeSign(
+  sign: SignItem,
+  width: number,
+  fontSize: number,
+  resolvedTerms: ResolvedTerm[],
+): SignAnalysis {
   const lines = estimatedLines(sign.targetText, width, fontSize);
   const lineCapacity = Math.max(1, Math.floor((width * 0.62) / (fontSize * 1.25)));
   const visible = lines.slice(0, lineCapacity);
   const overflow = lines.length > lineCapacity;
   const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
+  void longest;
   const estimatedCharacterLimit = Math.max(12, Math.floor((width - 48) / (fontSize * 0.55)) * lineCapacity);
   const tooLong = sign.targetText.replace(/\s/g, "").length > estimatedCharacterLimit;
-  const missingTerms = sign.terms.filter(
-    (term) => term.required && !sign.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase()),
+  const haystack = sign.targetText.toLocaleLowerCase();
+  const missingTerms = resolvedTerms.filter(
+    (item) => item.ref.required && item.canonicalTarget !== null && !haystack.includes(item.canonicalTarget.toLocaleLowerCase()),
   );
   return {
     lines,
@@ -53,7 +74,7 @@ export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
 }
 
 function tokenize(value: string) {
-  return value.match(/[\u3400-\u9fff]|[A-Za-zÀ-ÿ0-9'’\-]+|\s+|./gu) ?? [];
+  return value.match(/[\u3400-\u9fff]|[A-Za-zÀ-ÿ0-9'\u2019\-]+|\s+|./gu) ?? [];
 }
 
 function lcsTable(left: string[], right: string[]) {
@@ -99,8 +120,4 @@ export function diffText(oldText: string, newText: string): DiffToken[] {
   while (i < left.length) push("remove", left[i++]);
   while (j < right.length) push("add", right[j++]);
   return tokens;
-}
-
-export function cloneTerms(terms: TermBinding[]) {
-  return structuredClone(terms);
 }
